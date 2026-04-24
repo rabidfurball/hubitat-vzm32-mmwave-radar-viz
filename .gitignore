@@ -1,0 +1,11 @@
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# User-supplied floor plans / config — keep local
+floor*.png
+floor*.jpg
+floor*.jpeg
+floor*.webp
+zones-*.json
