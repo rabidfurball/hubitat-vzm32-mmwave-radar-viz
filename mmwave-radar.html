@@ -154,6 +154,13 @@
     </div>
     <button class="danger small" onclick="clearFloorplan()">Clear Floorplan</button>
 
+    <div style="margin-top:8px; padding-top:8px; border-top:1px solid #333">
+      <button onclick="startCalibration()" id="calibBtn">Calibrate by Walking</button>
+      <button class="secondary small" onclick="cancelCalibration()" id="calibCancelBtn" style="display:none">Cancel</button>
+      <div id="calibStatus" style="font-size:11px; color:#999; margin-top:4px"></div>
+      <div style="font-size:10px; color:#666; margin-top:2px">Stand at known spot, click your spot on the floor plan. Repeat at a different spot. Two clicks = scale + rotation + offset.</div>
+    </div>
+
     <hr>
     <h3>Display</h3>
     <label>Trail Length</label>
@@ -205,6 +212,7 @@ let ws = null;
 let devices = [];  // [{id, name, palette, offsetX, offsetY, targets: {id -> {x,y,z,dop,trail}}, illuminance, motion, lastUpdate, updateCount}]
 let zones = [];
 let floorplan = { img: null, x: 0, y: 0, scale: 1, rotation: 0, opacity: 0.3 };
+let calibration = { active: false, points: [] };  // {clickPx:{x,y}, targetCm:{x,y}, deviceName}
 let heatmapData = [];  // [{x, y}] in cm coordinates
 let rateInterval = null;
 let globalUpdateCount = 0;
@@ -245,6 +253,190 @@ canvas.addEventListener('mousemove', (e) => {
 canvas.addEventListener('mouseleave', () => {
   document.getElementById('cursorInfo').textContent = '';
 });
+
+// Click handler — used by calibration mode. Outside calibration, no-op.
+canvas.addEventListener('click', (e) => {
+  if (!calibration.active) return;
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+  recordCalibrationPoint(px, py);
+});
+
+// --- Floor plan calibration ---
+//
+// User clicks on the floor plan at the spot where they're physically
+// standing. We grab the most-recently-updated radar target (the user)
+// and store a (clickPixel, targetCm) pair.
+//
+// With 2 such pairs we can solve for floorplan.scale, .rotation, .x, .y
+// such that the floor plan IMAGE PIXEL under each click ends up at the
+// canvas position where the corresponding radar target is plotted.
+//
+// Math: similarity transform from current image pixel coords to target
+// radar canvas coords. 2 point pairs = unique solution. (3+ would need
+// least-squares; v0.2 stops at 2 — re-run to refine.)
+
+function startCalibration() {
+  if (!floorplan.img) {
+    alert('Load a floor plan image first.');
+    return;
+  }
+  if (devices.length === 0) {
+    alert('Add at least one device first so the radar has target data.');
+    return;
+  }
+  calibration.active = true;
+  calibration.points = [];
+  document.getElementById('calibBtn').style.display = 'none';
+  document.getElementById('calibCancelBtn').style.display = 'inline-block';
+  canvas.style.cursor = 'crosshair';
+  updateCalibStatus();
+}
+
+function cancelCalibration() {
+  calibration.active = false;
+  calibration.points = [];
+  document.getElementById('calibBtn').style.display = 'inline-block';
+  document.getElementById('calibCancelBtn').style.display = 'none';
+  canvas.style.cursor = '';
+  updateCalibStatus();
+}
+
+function updateCalibStatus() {
+  const el = document.getElementById('calibStatus');
+  if (!calibration.active) { el.textContent = ''; return; }
+  const n = calibration.points.length;
+  if (n === 0) el.textContent = 'Stand at spot 1, click your spot on the floor plan.';
+  else if (n === 1) el.textContent = `Spot 1 captured. Walk to a different spot, then click it on the floor plan.`;
+}
+
+function recordCalibrationPoint(clickPx, clickPy) {
+  // Find the most-recently-updated target across all enabled devices.
+  // That's almost certainly "the user" if they just clicked while moving.
+  let bestTarget = null, bestDevice = null, bestT = 0;
+  devices.forEach(d => {
+    Object.values(d.targets || {}).forEach(t => {
+      // Targets don't carry their own timestamp, so use device.lastUpdate
+      if ((d.lastUpdate || 0) > bestT) {
+        bestT = d.lastUpdate || 0;
+        bestTarget = t;
+        bestDevice = d;
+      }
+    });
+  });
+  if (!bestTarget) {
+    alert('No active radar target detected. Make sure you are standing in a switch\'s field of view, then try clicking again.');
+    return;
+  }
+
+  // Apply this device's offset so all calibration math is in the canvas's
+  // shared coordinate frame.
+  const targetCm = {
+    x: bestTarget.x + (bestDevice.offsetX || 0),
+    y: bestTarget.y + (bestDevice.offsetY || 0)
+  };
+
+  calibration.points.push({
+    clickPx: { x: clickPx, y: clickPy },
+    targetCm,
+    deviceName: bestDevice.name
+  });
+  updateCalibStatus();
+
+  if (calibration.points.length >= 2) {
+    applyCalibration();
+  }
+}
+
+function applyCalibration() {
+  const [p1, p2] = calibration.points;
+
+  // 1. Convert the current floor plan transform back to image-pixel
+  //    coordinates for each click (i.e. which pixel of the image is
+  //    currently displayed under each click point).
+  const cx = canvasOriginX();
+  const cy = canvasOriginY();
+  const imgCx = floorplan.img.width / 2;
+  const imgCy = floorplan.img.height / 2;
+  const oldRotRad = floorplan.rotation * Math.PI / 180;
+  const cosO = Math.cos(-oldRotRad), sinO = Math.sin(-oldRotRad);
+
+  function clickToImagePixel(click) {
+    // canvas → floor-plan-local (centered) → image pixel
+    const cxRel = click.x - (cx + floorplan.x);
+    const cyRel = click.y - (cy + floorplan.y);
+    // inverse rotate
+    const lx = cxRel * cosO - cyRel * sinO;
+    const ly = cxRel * sinO + cyRel * cosO;
+    // inverse scale, then back to image pixel coords
+    return { x: lx / floorplan.scale + imgCx, y: ly / floorplan.scale + imgCy };
+  }
+
+  function targetToCanvas(t) {
+    return { x: cx + cmScale() * t.x, y: cy - cmScale() * t.y };
+  }
+
+  const ip1 = clickToImagePixel(p1.clickPx);
+  const ip2 = clickToImagePixel(p2.clickPx);
+  const tc1 = targetToCanvas(p1.targetCm);
+  const tc2 = targetToCanvas(p2.targetCm);
+
+  // 2. Solve similarity transform from image pixels → canvas:
+  //    canvas = (cx + offX, cy + offY) + R(theta) * scale * (imagePixel - imgCenter)
+  const vImg = { x: ip2.x - ip1.x, y: ip2.y - ip1.y };
+  const vCv  = { x: tc2.x - tc1.x, y: tc2.y - tc1.y };
+  const magImg = Math.hypot(vImg.x, vImg.y);
+  const magCv  = Math.hypot(vCv.x,  vCv.y);
+  if (magImg < 1 || magCv < 1) {
+    alert('Calibration points are too close together. Try again with spots that are farther apart.');
+    cancelCalibration();
+    return;
+  }
+  const newScale = magCv / magImg;
+  const newRotRad = Math.atan2(vCv.y, vCv.x) - Math.atan2(vImg.y, vImg.x);
+  const newRotDeg = ((newRotRad * 180 / Math.PI) % 360 + 360) % 360;
+
+  // Solve for offset using point 1: tc1 = (cx + offX, cy + offY) + R * scale * (ip1 - imgCenter)
+  const cosN = Math.cos(newRotRad), sinN = Math.sin(newRotRad);
+  const dx = (ip1.x - imgCx) * newScale;
+  const dy = (ip1.y - imgCy) * newScale;
+  const rotDx = dx * cosN - dy * sinN;
+  const rotDy = dx * sinN + dy * cosN;
+  const newOffX = tc1.x - cx - rotDx;
+  const newOffY = tc1.y - cy - rotDy;
+
+  // 3. Apply to floor plan transform
+  floorplan.scale = newScale;
+  floorplan.rotation = newRotDeg;
+  floorplan.x = newOffX;
+  floorplan.y = newOffY;
+
+  // 4. Sync sliders so the UI reflects the new values
+  syncFloorplanSliders();
+
+  document.getElementById('calibStatus').textContent =
+    `Calibrated! scale=${newScale.toFixed(3)} rotation=${newRotDeg.toFixed(1)}° offset=(${newOffX.toFixed(0)}, ${newOffY.toFixed(0)}). Click "Calibrate by Walking" to redo.`;
+  cancelCalibration();
+  // Re-show status (cancelCalibration cleared it)
+  setTimeout(() => {
+    document.getElementById('calibStatus').textContent =
+      `Last calibration: scale ${newScale.toFixed(3)}, rot ${newRotDeg.toFixed(1)}°.`;
+  }, 50);
+}
+
+function syncFloorplanSliders() {
+  const set = (id, val, valId, fmt) => {
+    const inp = document.getElementById(id);
+    if (inp) inp.value = val;
+    const lbl = document.getElementById(valId);
+    if (lbl) lbl.textContent = fmt ? fmt(val) : val;
+  };
+  set('fpScale', floorplan.scale, 'fpScaleVal', v => (+v).toFixed(2));
+  set('fpRot', Math.round(floorplan.rotation), 'fpRotVal', v => v);
+  set('fpX', Math.round(floorplan.x), 'fpXVal', v => v);
+  set('fpY', Math.round(floorplan.y), 'fpYVal', v => v);
+}
 
 // --- Connection ---
 function connect() {
@@ -874,11 +1066,32 @@ function draw() {
   ctx.fillStyle = '#aaa';
   ctx.fillText('F  Floor/Pet (z < -60)', legendX + 10, legendY + 35);
 
+  // Calibration markers — small numbered circles where user has clicked
+  if (calibration.points.length > 0) {
+    calibration.points.forEach((p, i) => {
+      ctx.beginPath();
+      ctx.arc(p.clickPx.x, p.clickPx.y, 8, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffeb3b';
+      ctx.fill();
+      ctx.strokeStyle = '#000';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.fillStyle = '#000';
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(i + 1), p.clickPx.x, p.clickPx.y);
+      ctx.textAlign = 'start';
+      ctx.textBaseline = 'alphabetic';
+    });
+  }
+
   requestAnimationFrame(draw);
 }
 
 // --- Init ---
-addDevice('1405', 'Theatre');
+// Note: no devices auto-added. Connect to your hub, then click a device
+// chip in the preset grid (or use the Devices section) to start plotting.
 renderPresetGrid();
 draw();
 </script>

@@ -15,8 +15,9 @@ detection.
   same canvas; each device gets its own color palette + per-device
   position offset so you can lay out the whole house
 - **Floor plan overlay** — load a PNG/JPG/WebP of your floor plan
-  and align it underneath the radar plot (opacity, scale, x/y
-  offset, rotation controls)
+  and align it underneath the radar plot. Manual sliders OR
+  **calibrate-by-walking** (click two spots on the floor plan
+  while standing at each — solves scale + rotation + offset)
 - **Rectangular zones** — define up to N rectangles per device,
   visualize them on the canvas, see live occupancy as targets pass
   through
@@ -79,10 +80,16 @@ In the **Floorplan Overlay** section:
 - **Load Image** — file picker for a local PNG/JPG/WebP, OR
 - **URL** — paste a URL (must be CORS-accessible from your browser)
 
-Then use the opacity / scale / offset / rotation sliders to align
-the image with the device coordinate system. The switches' physical
-positions on the floor plan should line up with the (0, 0) anchor
-on the radar grid (at each switch).
+Then either:
+- **Calibrate by walking** (recommended) — click `Calibrate by Walking`,
+  stand in the field of view of one of your switches, and click the
+  spot on the floor plan where you're physically standing. Walk to a
+  visibly different spot, click again. The tool computes scale,
+  rotation, and offset from those two (click, target) pairs and
+  applies them. Re-run any time to refine.
+- **Manual** — use the opacity / scale / offset / rotation sliders to
+  align the image by eye. Slower and less accurate but doesn't
+  require walking around.
 
 ### Defining zones
 
